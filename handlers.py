@@ -20,8 +20,9 @@ try:
     }
 except ImportError:
     tab_completion = {}
-from misc import sage_json, Config
-config = Config()
+
+import misc
+config = misc.Config()
 
 
 class RootHandler(tornado.web.RequestHandler):
@@ -219,7 +220,7 @@ class Completer(object):
         msg = self.session.unserialize(msg)
         msg_id = msg["parent_header"]["msg_id"]
         kc = self.waiting.pop(msg_id)
-        kc.send("complete," + jsonapi.dumps(msg, default=sage_json))
+        kc.send("complete," + jsonapi.dumps(msg, default=misc.sage_json))
 
 
 class KernelConnection(sockjs.tornado.SockJSConnection):
@@ -341,34 +342,33 @@ class ServiceHandler(tornado.web.RequestHandler):
             return
         remote_ip = self.request.remote_ip
         referer = self.request.headers.get('Referer', '')
-        self.kernel_id = yield tornado.gen.Task(
-            self.application.km.new_session_async,
-            referer=referer,
-            remote_ip=remote_ip,
+        self.kernel = yield tornado.gen.Task(
+            self.application.kernel_dealer.get_kernel,
+            resource_limits=config.get("provider_settings")["resource_limits"],
             timeout=0)
         sm = StatsMessage(
-            kernel_id=self.kernel_id,
+            kernel_id=self.kernel.id,
             remote_ip=remote_ip,
             referer=referer,
             code=code,
             execute_type='service')
-        if remote_ip == '127.0.0.1' and self.kernel_id:
+        if remote_ip == '127.0.0.1':
             stats_logger.debug(sm)
         else:
             stats_logger.info(sm)
-        if not self.kernel_id:
+        if not self.kernel: #FIXME to something working
             logger.error('could not obtain a valid kernel_id')
             self.set_status(503)
             self.finish()
             return
         self.zmq_handler = ZMQServiceHandler()
-        self.zmq_handler.open(self.application, self.kernel_id)
+        self.zmq_handler.open(self.kernel)
         loop = tornado.ioloop.IOLoop.instance()
         
         def kernel_callback(msg):
             if msg['msg_type'] == 'execute_reply':
                 loop.remove_timeout(self.timeout_handle)
-                logger.debug('service request finished for %s', self.kernel_id)
+                logger.debug('service request finished for %s', self.kernel.id)
                 streams = self.zmq_handler.streams
                 streams['success'] = msg['content']['status'] == 'ok'
                 streams['execute_reply'] = msg['content']
@@ -377,7 +377,7 @@ class ServiceHandler(tornado.web.RequestHandler):
         self.zmq_handler.msg_from_kernel_callbacks.append(kernel_callback)
         
         def timeout_callback():
-            logger.debug('service request timed out for %s', self.kernel_id)
+            logger.debug('service request timed out for %s', self.kernel.id)
             loop.add_callback(self.finish_request)
 
         self.timeout_handle = loop.call_later(30, timeout_callback)
@@ -387,7 +387,7 @@ class ServiceHandler(tornado.web.RequestHandler):
             'header': {
                 'msg_id': str(uuid.uuid4()),
                 'username': '',
-                'session': self.kernel_id,
+                'session': self.kernel.id,
                 'msg_type': 'execute_request',
                },
             'content': {
@@ -402,8 +402,8 @@ class ServiceHandler(tornado.web.RequestHandler):
         self.zmq_handler.on_message(jsonapi.dumps(exec_message))
 
     def finish_request(self):
-        self.application.km.end_session(self.kernel_id)
         self.zmq_handler.on_close()
+        self.kernel.stop()
         self.finish(self.zmq_handler.streams)
 
 
@@ -423,14 +423,15 @@ class ZMQChannelsHandler(object):
         # can't encode buffers, so let's get rid of them if they exist
         msg.pop("buffers", None)
         # sage_json handles things like encoding dates and sage types
-        return jsonapi.dumps(msg, default=sage_json)
+        return jsonapi.dumps(msg, default=misc.sage_json)
 
     def _on_zmq_reply(self, stream, msg_list):
+        #logger.debug("_on_zmq_reply %s", msg_list)
         if stream.closed():
             return
         try:
-            idents, msg_list = self.session.feed_identities(msg_list)
-            msg = self.session.unserialize(msg_list)
+            idents, msg_list = self.kernel.session.feed_identities(msg_list)
+            msg = self.kernel.session.unserialize(msg_list)
             if all([f(msg) is not False
                     for f in self.msg_from_kernel_callbacks]):
                 msg["channel"] = stream.channel
@@ -438,42 +439,42 @@ class ZMQChannelsHandler(object):
         except ValueError as e:
             logger.exception("ValueError in _on_zmq_reply: %s", e.message)
         if stream.channel == "shell" and self.kill_kernel:
-            self.channels["shell"].flush()
+            self.kernel.channels["shell"].flush()
             self.kernel_died()
 
     def _reset_deadline(self, msg):
-        if msg["header"]["msg_type"] in ("execute_reply",
-                                         "sagenb.interact.update_interact_reply"):
-            timeout = self.kernel["timeout"]
-            if timeout == 0 and self.kernel["executing"] == 1:
+        if msg["header"]["msg_type"] in (
+                "execute_reply",
+                "sagenb.interact.update_interact_reply"):
+            kernel = self.kernel
+            if kernel.timeout == 0 and kernel.executing == 1:
                 # kill the kernel before the heartbeat is able to
                 self.kill_kernel = True
             else:
-                self.kernel["deadline"] = min(
-                    time.time() + timeout, self.kernel["hard_deadline"])
-                self.kernel["executing"] -= 1
+                kernel.deadline = min(
+                    time.time() + kernel.timeout, kernel.hard_deadline)
+                kernel.executing -= 1
                 logger.debug("decreased execution counter for %s to %s",
-                             self.kernel_id, self.kernel["executing"])
+                             kernel.id, kernel.executing)
 
     def _reset_timeout(self, msg):
         if msg["header"]["msg_type"] == "kernel_timeout":
             timeout = float(msg["content"]["timeout"])
             if timeout >= 0:
-                self.kernel["timeout"] = min(
-                    timeout, self.kernel["max_timeout"])
+                self.kernel.timeout = min(
+                    timeout, self.kernel.max_timeout)
             return False
 
     def kernel_died(self):
         try: # in case kernel has already been killed
-            self.channels["iopub"].flush()
-            self.application.km.end_session(self.kernel_id)
+            self.kernel.channels["iopub"].flush()
         except IOError:
             pass
         msg = {
             "channel": "iopub",
             'header': {
                 'msg_type': 'status',
-                'session': self.kernel_id,
+                'session': self.kernel.id,
                 'msg_id': str(uuid.uuid4()),
                 'username': ''
             },
@@ -485,33 +486,27 @@ class ZMQChannelsHandler(object):
         self.on_close()
 
     def on_close(self):
-        for stream in self.channels.itervalues():
-            if stream is not None and not stream.closed():
-                stream.on_recv_stream(None)
-                stream.close()
-        if hasattr(self, "hb_stream") and not self.hb_stream.closed():
-            self.stop_hb()
-        self.application.km.end_session(self.kernel_id)
+        for channel in ["iopub", "shell"]:
+            self.kernel.channels[channel].on_recv_stream(None)
 
     def on_message(self, msg):
         # shell only, was just pass in iopub
-        if self.application.km._kernels.get(self.kernel_id) is not None:
-            msg = jsonapi.loads(msg)
-            for f in self.msg_to_kernel_callbacks:
-                f(msg)
-            if msg['header']['msg_type'] in ('execute_request',
-                                             'sagenb.interact.update_interact'):
-                self.kernel["executing"] += 1
-                logger.debug("increased execution counter for %s to %s",
-                             self.kernel_id, self.kernel["executing"])
-            self.session.send(self.channels["shell"], msg)
+        # if self.application.km._kernels.get(self.kernel.id) is not None:
+        # What was it supposed to check???
+        msg = jsonapi.loads(msg)
+        for f in self.msg_to_kernel_callbacks:
+            f(msg)
+        kernel = self.kernel
+        if msg['header']['msg_type'] in ('execute_request',
+                                         'sagenb.interact.update_interact'):
+            kernel.executing += 1
+            logger.debug("increased execution counter for %s to %s",
+                kernel.id, kernel.executing)
+        # What's the difference with https://github.com/ipython/ipykernel/blob/master/ipykernel/kernelapp.py#L375
+        kernel.session.send(kernel.channels["shell"], msg)
 
-    def open(self, application, kernel_id):
-        self.application = application
-        self.kernel_id = kernel_id
-        km = application.km
-        self.session = km._sessions[kernel_id]
-        self.kernel = km._kernels[kernel_id]
+    def open(self, kernel):
+        self.kernel = kernel
         self.msg_from_kernel_callbacks = [self._reset_deadline,
                                           self._reset_timeout]
         self.msg_to_kernel_callbacks = []
@@ -523,77 +518,8 @@ class ZMQChannelsHandler(object):
         #self.msg_to_kernel_callbacks.insert(0, log_to)
         
         self.kill_kernel = False
-        self.channels = {}
-        for channel in ('shell', 'iopub'):  #, 'stdin'
-            meth = getattr(km, 'create_' + channel + "_stream")
-            self.channels[channel] = stream = meth(kernel_id)
-            stream.channel = channel
-            stream.on_recv_stream(self._on_zmq_reply)
-        self.start_hb()
-
-    def start_hb(self):
-        """
-        Starts a series of delayed callbacks to send and
-        receive small messages from the heartbeat stream of
-        an IPython kernel. The specific delay paramaters for
-        the callbacks are set by configuration values in a
-        kernel manager associated with the web application.
-        """
-        logger.debug("start_hb for %s", self.kernel_id)
-        self._kernel_alive = True
-        km = self.application.km
-        self.hb_stream = km.create_hb_stream(self.kernel_id)
-
-        def beat_received(message):
-            self._kernel_alive = True
-
-        self.hb_stream.on_recv(beat_received)
-
-        def ping_or_dead():
-            self.hb_stream.flush()
-            now = time.time()
-            if now > self.kernel["deadline"] and self.kernel["executing"] == 0:
-                # only kill the kernel after all pending
-                # execute requests have finished
-                self._kernel_alive = False
-            if now > self.kernel["hard_deadline"]:
-                self._kernel_alive = False
-                logger.info("hard deadline reached for %s", self.kernel_id)
-            if self._kernel_alive:
-                self._kernel_alive = False
-                self.hb_stream.send(b'ping')
-                # flush stream to force immediate socket send
-                self.hb_stream.flush()
-            else:
-                self.kernel_died()
-                self.stop_hb()
-
-        beat_interval, first_beat = km.get_hb_info(self.kernel_id)
-        loop = tornado.ioloop.IOLoop.instance()
-        self._hb_periodic_callback = \
-            tornado.ioloop.PeriodicCallback(
-                ping_or_dead, beat_interval * 1000, loop)
-
-        def delayed_start():
-            # Make sure we haven't been closed during the wait.
-            logger.debug("delayed_start for %s", self.kernel_id)
-            if self._beating and not self.hb_stream.closed():
-                self._hb_periodic_callback.start()
-
-        self._start_hb_handle = loop.add_timeout(time.time() + first_beat, delayed_start)
-        self._beating = True
-
-    def stop_hb(self):
-        """Stop the heartbeating and cancel all related callbacks."""
-        logger.debug("stop_hb for %s", self.kernel_id)
-        if self._beating:
-            self._beating = False
-            self._hb_periodic_callback.stop()
-            tornado.ioloop.IOLoop.instance().remove_timeout(
-                self._start_hb_handle)
-            if not self.hb_stream.closed():
-                self.hb_stream.on_recv(None)
-                self.hb_stream.close()
+        for channel in ["iopub", "shell"]:
+            kernel.channels[channel].on_recv_stream(self._on_zmq_reply)
 
 
 class ZMQServiceHandler(ZMQChannelsHandler):
@@ -603,8 +529,8 @@ class ZMQServiceHandler(ZMQChannelsHandler):
             if msg["header"]["msg_type"] == "stream":
                 self.streams[msg["content"]["name"]] += msg["content"]["text"]
 
-    def open(self, application, kernel_id):
-        super(ZMQServiceHandler, self).open(application, kernel_id)
+    def open(self, kernel):
+        super(ZMQServiceHandler, self).open(kernel)
         from collections import defaultdict
         self.streams = defaultdict(unicode)
 
@@ -615,7 +541,7 @@ class SockJSChannelsHandler(ZMQChannelsHandler):
         self.callback = callback
 
     def _output_message(self, msg):
-        self.callback("%s/channels,%s" % (self.kernel_id, self._json_msg(msg)))
+        self.callback("%s/channels,%s" % (self.kernel.id, self._json_msg(msg)))
 
 
 class WebChannelsHandler(ZMQChannelsHandler,
@@ -624,8 +550,8 @@ class WebChannelsHandler(ZMQChannelsHandler,
     def _output_message(self, msg):
         self.write_message(self._json_msg(msg))
         
-    def open(self, kernel_id):
-        super(WebChannelsHandler, self).open(self.application, kernel_id)
+    def open(self, kernel):
+        super(WebChannelsHandler, self).open(kernel)
 
 
 class StaticHandler(tornado.web.StaticFileHandler):
